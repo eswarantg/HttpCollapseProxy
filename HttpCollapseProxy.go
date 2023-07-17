@@ -3,7 +3,6 @@ package httpCollapseProxy
 import (
 	"context"
 	"errors"
-	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -14,84 +13,12 @@ type HttpProxy interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-// Errors
-var (
-	ErrReadingCommenced = errors.New("ReadingCommenced")
-)
-
-// Internal : Entry for collapsing requests
-type responseState struct {
-	lock    sync.Mutex
-	reader  *MultiTeeReaderWithFullRead
-	waiters []chan http.Response
-}
-
-// constructor
-func newResponseState() *responseState {
-	return &responseState{
-		lock:    sync.Mutex{},
-		reader:  nil,
-		waiters: []chan http.Response{},
-	}
-}
-
-// process the response once received
-// sets up the CopyReader for all waiters
-// Builds Response object with duplicate readers for each waiter
-// unblocks the waiters by sending the copy Response
-func (r *responseState) handleResponse(ctx context.Context, resp http.Response) (*http.Response, error) {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	// waiters are present
-	var writers []io.WriteCloser
-	if resp.Body != nil {
-		// list of upstream writers
-		writers = make([]io.WriteCloser, 0, len(r.waiters))
-	}
-	// for each waiter
-	for _, waiter := range r.waiters {
-		// copy the response object
-		copyResp := resp
-		if resp.Body != nil {
-			// create a pipe
-			rH, wH := io.Pipe()
-			// add writer to the upstream write list
-			writers = append(writers, wH)
-			// add reader to the downstream read as resp.Body
-			copyResp.Body = rH
-		}
-		// unblock waiter with
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case waiter <- copyResp:
-		}
-	}
-	if resp.Body != nil {
-		// link the upstream reader with list of writers to copy to
-		r.reader = NewMultiTeeReaderWithFullRead(resp.Body, writers)
-		// original response include the MultiReader for copy
-		resp.Body = r.reader
-	}
-	return &resp, nil
-}
-
-// adds a waiter to existing request
-func (r *responseState) addWaiter(ch chan http.Response) error {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	if r.reader != nil {
-		return ErrReadingCommenced
-	}
-	r.waiters = append(r.waiters, ch)
-	return nil
-}
-
 type HttpCollapseProxy struct {
-	ctx      context.Context
-	proxy    HttpProxy
-	requests map[string]*responseState
-	lock     sync.Mutex
+	ctx       context.Context
+	proxy     HttpProxy
+	requests  map[string]*responseState
+	MakeKeyFn func(req *http.Request) string
+	lock      sync.Mutex
 }
 
 // Create Map key from request
@@ -102,10 +29,11 @@ func makeKey(req *http.Request) string {
 // Constructor
 func NewHttpCollapseProxy(ctx context.Context, proxy HttpProxy) HttpCollapseProxy {
 	return HttpCollapseProxy{
-		ctx:      ctx,
-		proxy:    proxy,
-		requests: make(map[string]*responseState),
-		lock:     sync.Mutex{},
+		ctx:       ctx,
+		proxy:     proxy,
+		requests:  make(map[string]*responseState),
+		MakeKeyFn: makeKey,
+		lock:      sync.Mutex{},
 	}
 }
 
@@ -115,7 +43,7 @@ func NewHttpCollapseProxy(ctx context.Context, proxy HttpProxy) HttpCollapseProx
 // Returns a channel to wait for Response
 func (p *HttpCollapseProxy) lookupAndAddDependent(ctx context.Context, req *http.Request) (chan http.Response, error) {
 	// create key
-	key := makeKey(req)
+	key := p.MakeKeyFn(req)
 	// channel to accept response
 	var entry *responseState
 	var ok bool
@@ -152,8 +80,7 @@ func (p *HttpCollapseProxy) lookupAndAddDependent(ctx context.Context, req *http
 			//second entry
 			err := entry.addWaiter(ch)
 			if err != nil {
-				switch err {
-				case ErrReadingCommenced:
+				if errors.Is(err, ErrReadingCommenced) {
 					// unable to add due to Channel Reading already commenced
 					func() {
 						p.lock.Lock()
@@ -164,8 +91,8 @@ func (p *HttpCollapseProxy) lookupAndAddDependent(ctx context.Context, req *http
 					}()
 					continue
 				}
-				toCloseCh = true
 				// other error
+				toCloseCh = true
 				return nil, err
 			}
 		}

@@ -7,6 +7,11 @@ import (
 	"sync/atomic"
 )
 
+// Errors
+var (
+	ErrReadingCommenced = errors.New("reading has commenced and cannot add")
+)
+
 // MultiTeeReaderWithFullRead
 // Copies Read() into multiple Writers
 // Also if the main Read doesn't complete till EOF
@@ -35,7 +40,7 @@ func NewMultiTeeReaderWithFullRead(r io.ReadCloser, w []io.WriteCloser) *MultiTe
 // Creates MultiTeeReaderWithFullRead with Multiple Writers
 func (d *MultiTeeReaderWithFullRead) AddWriter(w io.WriteCloser) error {
 	if d.byteWritten.Load() {
-		return errors.New("cannot add writer, as writing already included")
+		return ErrReadingCommenced
 	}
 	// add Writer to the list
 	d.writers = append(d.writers, w)
