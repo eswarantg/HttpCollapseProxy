@@ -49,7 +49,7 @@ func (p *HttpCollapseProxy) lookupAndAddDependent(ctx context.Context, req *http
 	var ok bool
 	var newEntry bool
 	// create channel to be responded
-	ch := make(chan http.Response)
+	ch := make(chan http.Response, 1)
 	toCloseCh := false
 	if toCloseCh {
 		close(ch)
@@ -78,7 +78,7 @@ func (p *HttpCollapseProxy) lookupAndAddDependent(ctx context.Context, req *http
 		// entry must be valid
 		if !newEntry {
 			//second entry
-			err := entry.addWaiter(ch)
+			err := entry.addWaiter(ctx, ch)
 			if err != nil {
 				if errors.Is(err, ErrReadingCommenced) {
 					// unable to add due to Channel Reading already commenced

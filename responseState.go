@@ -9,17 +9,19 @@ import (
 
 // Internal : Entry for collapsing requests
 type responseState struct {
-	lock    sync.Mutex
-	reader  *MultiTeeReaderWithFullRead
-	waiters []chan http.Response
+	lock     sync.Mutex
+	reader   *MultiTeeReaderWithFullRead
+	waiters  []chan http.Response
+	respRecd *http.Response
 }
 
 // constructor
 func newResponseState() *responseState {
 	return &responseState{
-		lock:    sync.Mutex{},
-		reader:  nil,
-		waiters: []chan http.Response{},
+		lock:     sync.Mutex{},
+		reader:   nil,
+		waiters:  []chan http.Response{},
+		respRecd: nil,
 	}
 }
 
@@ -30,6 +32,12 @@ func newResponseState() *responseState {
 func (r *responseState) handleResponse(ctx context.Context, resp http.Response) (*http.Response, error) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
+
+	// Save the resp object
+	copyRespRecd := resp
+	copyRespRecd.Body = nil
+	r.respRecd = &copyRespRecd
+
 	// waiters are present
 	var writers []io.WriteCloser
 	if resp.Body != nil {
@@ -65,11 +73,29 @@ func (r *responseState) handleResponse(ctx context.Context, resp http.Response) 
 }
 
 // adds a waiter to existing request
-func (r *responseState) addWaiter(ch chan http.Response) error {
+func (r *responseState) addWaiter(ctx context.Context, ch chan http.Response) error {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	if r.reader != nil {
-		return ErrReadingCommenced
+		copyResp := *r.respRecd
+		if len(r.reader.writers) > 0 {
+			// create a pipe
+			rH, wH := io.Pipe()
+			err := r.reader.AddWriter(wH)
+			if err != nil {
+				wH.Close()
+				rH.Close()
+				return err
+			}
+			// add reader to the downstream read as resp.Body
+			copyResp.Body = rH
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case ch <- copyResp:
+			}
+		}
+		return nil
 	}
 	r.waiters = append(r.waiters, ch)
 	return nil
